@@ -2,7 +2,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use microsandbox_protocol::exec::EXEC_STDIN_WINDOW;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
 use crate::{MicrosandboxError, MicrosandboxResult};
@@ -33,9 +32,9 @@ struct Offsets {
 //--------------------------------------------------------------------------------------------------
 
 impl InputWindow {
-    pub(super) fn new() -> Arc<Self> {
+    pub(super) fn new(bytes: u32) -> Arc<Self> {
         Arc::new(Self {
-            available: Semaphore::new(EXEC_STDIN_WINDOW as usize),
+            available: Semaphore::new(bytes as usize),
             offsets: Mutex::new(Offsets::default()),
         })
     }

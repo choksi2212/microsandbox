@@ -161,6 +161,7 @@ pub struct ExecSession {
     output_window: Option<Arc<OutputWindow>>,
     stdin_consumed: u64,
     stdin_credit_sent: u64,
+    stdin_credit_enabled: bool,
 }
 
 #[derive(Debug)]
@@ -705,7 +706,7 @@ impl ExecSession {
     }
 
     pub(crate) fn take_stdin_credit(&mut self) -> Option<u64> {
-        if self.output_window.is_some() && self.stdin_consumed != self.stdin_credit_sent {
+        if self.stdin_credit_enabled && self.stdin_consumed != self.stdin_credit_sent {
             self.stdin_credit_sent = self.stdin_consumed;
             Some(self.stdin_consumed)
         } else {
@@ -800,6 +801,7 @@ impl ExecSession {
     /// The restored process no longer has a host-side stdin owner. Drain everything accepted
     /// before the cut, then close pipe input. A PTY has no separate write half to close safely.
     pub(crate) fn detach_stdin(&mut self) {
+        self.stdin_credit_enabled = false;
         if let Some(window) = self.output_window.take() {
             window.detach();
         }
@@ -919,7 +921,7 @@ impl ExecSession {
         process_manager: &Arc<ProcessManager>,
         workload_placement: Option<WorkloadPlacement>,
     ) -> AgentdResult<Self> {
-        let output_window = OutputWindow::new(req.output_window_bytes)?;
+        let output_window = OutputWindow::new(req.output_limit)?;
         let pty = pty::openpty(None, None)?;
         let err_pipe = new_exec_error_pipe()?;
 
@@ -1149,6 +1151,7 @@ impl ExecSession {
             output_window,
             stdin_consumed: 0,
             stdin_credit_sent: 0,
+            stdin_credit_enabled: req.input_limit.is_some() || req.output_limit.is_some(),
         })
     }
 
@@ -1162,7 +1165,7 @@ impl ExecSession {
         process_manager: &Arc<ProcessManager>,
         workload_placement: Option<WorkloadPlacement>,
     ) -> AgentdResult<Self> {
-        let output_window = OutputWindow::new(req.output_window_bytes)?;
+        let output_window = OutputWindow::new(req.output_limit)?;
         let mut cmd = Command::new(&req.cmd);
         cmd.args(&req.args)
             .stdin(Stdio::piped())
@@ -1256,6 +1259,7 @@ impl ExecSession {
             output_window,
             stdin_consumed: 0,
             stdin_credit_sent: 0,
+            stdin_credit_enabled: req.input_limit.is_some() || req.output_limit.is_some(),
         })
     }
 }
@@ -2146,7 +2150,8 @@ mod tests {
 
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
             cmd: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "sleep 30 & echo $!".to_string()],
             env: Vec::new(),
@@ -2291,7 +2296,8 @@ mod tests {
                 let _runtime = handle.enter();
                 let code = 20 + offset as i32;
                 let req = ExecRequest {
-                    output_window_bytes: None,
+                    output_limit: None,
+                    input_limit: None,
                     cmd: "/bin/sh".to_string(),
                     args: vec!["-c".to_string(), format!("exit {code}")],
                     env: Vec::new(),
@@ -2381,7 +2387,8 @@ mod tests {
     async fn run_single_pipe_spawn(id: u32, code: i32) {
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
             cmd: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), format!("exit {code}")],
             env: Vec::new(),
@@ -2547,7 +2554,8 @@ mod tests {
             for profile in [SecurityProfile::Default, SecurityProfile::Restricted] {
                 let (tx, mut rx) = SessionOutputSender::channel();
                 let req = ExecRequest {
-                    output_window_bytes: None,
+                    output_limit: None,
+                    input_limit: None,
                     cmd: std::env::current_exe().unwrap().to_str().unwrap().into(),
                     args: vec![
                         "--exact".into(),
@@ -2613,10 +2621,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stdin_credit_without_output_limit_tracks_pipe_delivery() {
+        let (tx, mut rx) = SessionOutputSender::channel();
+        let req: ExecRequest = serde_json::from_value(serde_json::json!({
+            "cmd": "/bin/cat", "input_limit": 16384
+        }))
+        .unwrap();
+        let mut session = ExecSession::spawn(19, &req, tx, None, SecurityProfile::Default, None)
+            .expect("spawn input-limited session");
+        assert_eq!(session.take_stdin_credit(), None);
+        session.enqueue_stdin(b"hello".to_vec(), None).unwrap();
+        assert_eq!(session.take_stdin_credit(), Some(5));
+        assert_eq!(session.take_stdin_credit(), None);
+        session.enqueue_stdin(Vec::new(), None).unwrap();
+
+        let mut output = Vec::new();
+        let result = time::timeout(Duration::from_secs(5), async {
+            while let Some(envelope) = rx.recv().await {
+                match envelope.output {
+                    SessionOutput::Stdout(data) => output.extend_from_slice(&data),
+                    SessionOutput::Exited(code) => return code,
+                    _ => {}
+                }
+            }
+            panic!("missing process exit");
+        })
+        .await;
+        if result.is_err() {
+            let _ = session.send_signal(libc::SIGKILL);
+        }
+        assert_eq!(result.unwrap(), 0);
+        assert_eq!(output, b"hello");
+    }
+
+    #[tokio::test]
     async fn test_pty_reader_drains_ready_fd() {
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
             cmd: "/bin/sh".to_string(),
             args: vec![
                 "-c".to_string(),
@@ -2685,7 +2728,8 @@ mod tests {
     #[test]
     fn test_request_user_overrides_config_default() {
         let req = ExecRequest {
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2704,7 +2748,8 @@ mod tests {
     #[test]
     fn test_config_default_user_used_when_request_has_none() {
         let req = ExecRequest {
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2728,7 +2773,8 @@ mod tests {
     #[test]
     fn test_request_without_user_does_not_apply_user_switch() {
         let req = ExecRequest {
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2753,7 +2799,8 @@ mod tests {
     #[test]
     fn test_default_home_dir_uses_resolved_user_home() {
         let req = ExecRequest {
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2783,7 +2830,8 @@ mod tests {
     #[test]
     fn test_default_home_dir_uses_root_when_user_absent() {
         let req = ExecRequest {
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2808,7 +2856,8 @@ mod tests {
     #[test]
     fn test_default_home_dir_respects_explicit_home_env() {
         let req = ExecRequest {
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: vec!["HOME=/tmp/custom".to_string()],
@@ -2837,7 +2886,8 @@ mod tests {
     async fn test_spawn_pipe_error_does_not_include_probe_details() {
         let (tx, _rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
             cmd: "/definitely/not/a/real/binary".to_string(),
             args: Vec::new(),
             env: Vec::new(),

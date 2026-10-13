@@ -14,7 +14,7 @@ pub const EXEC_OUTPUT_EVENT_OVERHEAD: u32 = 256;
 /// Minimum output window; permits at least one full guest read plus its metadata.
 pub const MIN_EXEC_OUTPUT_WINDOW: u32 = 64 * 1024;
 
-/// In-flight stdin bytes for an execution that negotiated output flow control.
+/// Default and maximum in-flight stdin bytes for credit-controlled execution.
 /// Keeping input bounded leaves the connection available for output credits.
 pub const EXEC_STDIN_WINDOW: u32 = 64 * 1024;
 
@@ -60,11 +60,16 @@ pub struct ExecRequest {
     #[serde(default)]
     pub rlimits: Vec<ExecRlimit>,
 
-    /// Optional generation-10 output window, shared by stdout and stderr.
+    /// Maximum unread output buffered per command, in bytes, shared by stdout and stderr.
     /// Each chunk costs its payload length plus `EXEC_OUTPUT_EVENT_OVERHEAD`.
-    /// Omission preserves unthrottled output for older SDKs.
+    /// Omission means unlimited output buffering. Requires generation 10.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_window_bytes: Option<u32>,
+    pub output_limit: Option<u32>,
+
+    /// Maximum outstanding stdin bytes selected by the host.
+    /// Presence enables stdin credit independently of output buffering (generation 10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_limit: Option<u32>,
 }
 
 /// A POSIX resource limit to apply to a spawned process.

@@ -210,7 +210,8 @@ mod tests {
             rows: 24,
             cols: 80,
             rlimits: Vec::new(),
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
         };
         let stream = client
             .stream(TypedMessage::new(MessageType::ExecRequest, &request))
@@ -417,7 +418,8 @@ mod tests {
             rows: 24,
             cols: 80,
             rlimits: Vec::new(),
-            output_window_bytes: None,
+            output_limit: None,
+            input_limit: None,
         };
         let mut rx = client
             .stream(TypedMessage::new(MessageType::ExecRequest, &request))

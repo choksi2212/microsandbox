@@ -99,7 +99,8 @@ Relative host paths stored in this file resolve from the file's directory, inclu
     }
   },
   "exec": {
-    "output_buffer_bytes": null
+    "output_limit": 1048576,
+    "input_limit": 65536
   },
   "ssh": {
     "inactivity_timeout_secs": 600
@@ -227,11 +228,14 @@ For a long-lived process, construct a new backend to pick up configuration chang
 
 | Field | Default | Description |
 |---|---|---|
-| `output_buffer_bytes` | `null` (unlimited) | Optional unread output limit per command, shared by stdout and stderr. Minimum: `65536` bytes (64 KiB). |
+| `output_limit` | `1048576` (1 MiB) | Maximum unread output buffered per command, in bytes, shared by stdout and stderr. Minimum: `65536` bytes (64 KiB); `null` disables the limit. |
+| `input_limit` | `65536` (64 KiB) | Maximum stdin bytes awaiting delivery to the command. Range: `16384`–`65536` bytes (16–64 KiB). |
 
-With a limit set, a full buffer pauses output until it is read. This does not limit total collected output or total process memory. Set it before constructing a backend; existing streams keep their original limit.
+A full output buffer pauses output until it is read. This does not limit total collected output or total process memory. Set it before constructing a backend; existing streams keep their original limit.
 
-Older guests retain unbounded buffering and warn if a configured limit cannot be enforced. They remain usable without restarting.
+Older guests retain legacy buffering, with a warning that the limits cannot be enforced. They remain usable without restarting.
+
+Large stdin writes are sent in 16 KiB chunks and wait when the input allowance is full. Neither setting limits the total data a command can transfer.
 
 See [Slow output readers](/sandboxes/commands#slow-output-readers) for how limits affect guest writes and concurrent stdin/output.
 

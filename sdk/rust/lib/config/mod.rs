@@ -892,7 +892,7 @@ mod tests {
                     "insecure": true
                 }}
             },
-            "exec": {"output_buffer_bytes": 1048576},
+            "exec": {"output_limit": 1048576, "input_limit": 32768},
             "ssh": {"inactivity_timeout_secs": 45},
             "metrics": {"capacity": 128},
             "snapshots": {"max_filesystem_state_mib": 64}

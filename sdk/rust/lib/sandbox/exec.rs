@@ -99,7 +99,7 @@ pub struct ExitStatus {
 
 /// Handle to a streaming exec session.
 ///
-/// Output buffering is unlimited by default. When `exec.output_buffer_bytes` is set,
+/// Output buffering defaults to 1 MiB, configurable through `exec.output_limit`. When set,
 /// supported guests wait on a full buffer until output is consumed. Older guests
 /// warn and retain unlimited buffering. Collection is not size-limited.
 pub struct ExecHandle {
@@ -635,12 +635,12 @@ pub(crate) mod agent {
         rows: u16,
         cols: u16,
     ) -> MicrosandboxResult<ExecHandle> {
-        let output_config = super::output::configuration(backend)?;
+        let exec_config = super::output::configuration(backend)?;
         let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
-        let controlled = output_config.output_buffer_bytes.is_some()
-            && client.supports(MessageType::ExecOutputCredit);
-        if output_config.output_buffer_bytes.is_some() && !controlled {
-            tracing::warn!(sandbox = %name, "guest does not support exec output backpressure; retaining legacy unbounded buffering (exec.output_buffer_bytes is not enforced)");
+        let controlled =
+            exec_config.output_limit.is_some() && client.supports(MessageType::ExecOutputCredit);
+        if exec_config.output_limit.is_some() && !controlled {
+            tracing::warn!(sandbox = %name, "guest does not support exec output backpressure; retaining legacy unbounded buffering (exec.output_limit is not enforced)");
         }
         let ExecOptions {
             args,
@@ -684,10 +684,16 @@ pub(crate) mod agent {
         let mut req = build_exec_request(
             config, cmd, args, cwd, user, &env, &rlimits, tty, rows, cols,
         );
-        req.output_window_bytes = output_config.output_buffer_bytes.filter(|_| controlled);
+        req.output_limit = exec_config.output_limit.filter(|_| controlled);
+        let input_controlled = client.supports(MessageType::ExecStdinCredit);
+        req.input_limit = input_controlled.then_some(exec_config.input_limit);
+        if !input_controlled {
+            tracing::warn!(sandbox = %name, "guest does not support exec stdin credit; exec.input_limit is not enforced");
+        }
         let (id, rx) = client.stream(MessageType::ExecRequest, &req).await?;
 
-        let input_window = controlled.then(super::input::InputWindow::new);
+        let input_window =
+            input_controlled.then(|| super::input::InputWindow::new(exec_config.input_limit));
         let stdin = match &stdin_mode {
             StdinMode::Pipe => Some(ExecSink::new(id, Arc::clone(&client), input_window.clone())),
             _ => None,
@@ -953,82 +959,99 @@ pub(crate) mod agent {
             use std::future::{Future, poll_fn};
             use std::task::Poll;
 
-            let (client, mut peer) = flow_test_client().await;
-            let window = super::super::input::InputWindow::new();
-            let sink = ExecSink::new(77, client.clone(), Some(window.clone()));
-            let filler = ExecStdin {
-                data: vec![1; 4096],
-            };
-            let mut pending: Vec<_> = (100..132)
-                .map(|id| Box::pin(client.send(id, MessageType::ExecStdin, &filler)))
-                .collect();
-            // Fill the real bounded writer queue while the peer does not read.
-            poll_fn(|cx| {
-                for send in &mut pending {
-                    assert!(send.as_mut().poll(cx).is_pending());
-                }
-                Poll::Ready(())
-            })
-            .await;
+            for limit in [16 * 1024, 32 * 1024, EXEC_STDIN_WINDOW] {
+                let (client, mut peer) = flow_test_client().await;
+                let window = super::super::input::InputWindow::new(limit);
+                let sink = ExecSink::new(77, client.clone(), Some(window.clone()));
+                let filler = ExecStdin {
+                    data: vec![1; 4096],
+                };
+                let mut pending: Vec<_> = (100..132)
+                    .map(|id| Box::pin(client.send(id, MessageType::ExecStdin, &filler)))
+                    .collect();
+                // Fill the real bounded writer queue while the peer does not read.
+                poll_fn(|cx| {
+                    for send in &mut pending {
+                        assert!(send.as_mut().poll(cx).is_pending());
+                    }
+                    Poll::Ready(())
+                })
+                .await;
 
-            for _ in 0..4 {
-                let mut write = Box::pin(sink.write(vec![2; 16 * 1024]));
+                for _ in 0..4 {
+                    let mut write = Box::pin(sink.write(vec![2; 16 * 1024]));
+                    poll_fn(|cx| {
+                        assert!(write.as_mut().poll(cx).is_pending());
+                        Poll::Ready(())
+                    })
+                    .await;
+                    drop(write);
+                }
+                drop(pending);
+
+                let receive = async {
+                    let mut bytes = 0;
+                    while bytes < limit as usize {
+                        let msg = microsandbox_protocol::codec::read_message(&mut peer)
+                            .await
+                            .unwrap();
+                        if msg.id == 77 {
+                            let data = msg.payload::<ExecStdin>().unwrap().data;
+                            assert!(data.iter().all(|byte| *byte == 3));
+                            bytes += data.len();
+                        }
+                    }
+                    assert_eq!(bytes, limit as usize);
+                };
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    tokio::join!(
+                        async {
+                            sink.write(vec![3; limit as usize]).await.unwrap();
+                        },
+                        receive
+                    );
+                })
+                .await
+                .expect("cancelled writes must not consume capacity");
+
+                let mut blocked = Box::pin(sink.write(vec![5; 16 * 1024]));
+                poll_fn(|cx| {
+                    assert!(blocked.as_mut().poll(cx).is_pending());
+                    Poll::Ready(())
+                })
+                .await;
+                assert!(
+                    tokio::time::timeout(
+                        Duration::from_millis(20),
+                        microsandbox_protocol::codec::read_message(&mut peer),
+                    )
+                    .await
+                    .is_err(),
+                    "a full configured input window must not admit another chunk",
+                );
+                drop(blocked);
+
+                assert!(window.acknowledge(u64::from(limit)));
+                let mut write = Box::pin(sink.write(vec![4; 16 * 1024]));
                 poll_fn(|cx| {
                     assert!(write.as_mut().poll(cx).is_pending());
                     Poll::Ready(())
                 })
                 .await;
+                // The frame is admitted, but the peer has not read it yet. Cancelling
+                // must keep its charge and allow the eventual acknowledgement.
                 drop(write);
+                let msg = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    microsandbox_protocol::codec::read_message(&mut peer),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(msg.id, 77);
+                assert_eq!(msg.payload::<ExecStdin>().unwrap().data, vec![4; 16 * 1024]);
+                assert!(window.acknowledge(u64::from(limit) + 16 * 1024));
             }
-            drop(pending);
-
-            let receive = async {
-                let mut bytes = 0;
-                while bytes < EXEC_STDIN_WINDOW as usize {
-                    let msg = microsandbox_protocol::codec::read_message(&mut peer)
-                        .await
-                        .unwrap();
-                    if msg.id == 77 {
-                        let data = msg.payload::<ExecStdin>().unwrap().data;
-                        assert!(data.iter().all(|byte| *byte == 3));
-                        bytes += data.len();
-                    }
-                }
-                assert_eq!(bytes, EXEC_STDIN_WINDOW as usize);
-            };
-            tokio::time::timeout(Duration::from_secs(3), async {
-                tokio::join!(
-                    async {
-                        sink.write(vec![3; EXEC_STDIN_WINDOW as usize])
-                            .await
-                            .unwrap();
-                    },
-                    receive
-                );
-            })
-            .await
-            .expect("cancelled writes must not consume capacity");
-
-            assert!(window.acknowledge(u64::from(EXEC_STDIN_WINDOW)));
-            let mut write = Box::pin(sink.write(vec![4; 16 * 1024]));
-            poll_fn(|cx| {
-                assert!(write.as_mut().poll(cx).is_pending());
-                Poll::Ready(())
-            })
-            .await;
-            // The frame is admitted, but the peer has not read it yet. Cancelling
-            // must keep its charge and allow the eventual acknowledgement.
-            drop(write);
-            let msg = tokio::time::timeout(
-                Duration::from_secs(3),
-                microsandbox_protocol::codec::read_message(&mut peer),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(msg.id, 77);
-            assert_eq!(msg.payload::<ExecStdin>().unwrap().data, vec![4; 16 * 1024]);
-            assert!(window.acknowledge(u64::from(EXEC_STDIN_WINDOW) + 16 * 1024));
         }
 
         #[tokio::test(start_paused = true)]
@@ -1040,7 +1063,7 @@ pub(crate) mod agent {
             for controlled in [false, true] {
                 let (client, mut peer) = flow_test_client().await;
                 let request: ExecRequest = serde_json::from_value(
-                    serde_json::json!({"cmd":"cat", "output_window_bytes":controlled.then_some(65536)}),
+                    serde_json::json!({"cmd":"cat", "output_limit":controlled.then_some(65536)}),
                 )
                 .unwrap();
                 let ((id, rx), _) = tokio::join!(

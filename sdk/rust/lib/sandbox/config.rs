@@ -2866,7 +2866,7 @@ mod layering_tests {
             json!({"paths":{"msb":"/host/msb"}}),
             json!({"runtime":{"block_writeback":{"mode":"off"}}}),
             json!({"registries":{"ca_certs":"/host/ca.pem"}}),
-            json!({"exec":{"output_buffer_bytes":1048576}}),
+            json!({"exec":{"output_limit":1048576}}),
             json!({"ssh":{"inactivity_timeout_secs":30}}),
             json!({"metrics":{"capacity":128}}),
             json!({"snapshots":{"max_filesystem_state_mib":64}}),

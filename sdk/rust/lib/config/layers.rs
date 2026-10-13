@@ -321,56 +321,73 @@ mod tests {
 
     #[test]
     fn exec_buffer_validates_after_managed_overrides() {
-        for (user, managed, expected) in [
-            ("{}", "{}", serde_json::Value::Null),
+        use serde_json::{Value, json};
+
+        for (field, user, managed, expected) in [
+            ("output_limit", json!({}), json!({}), json!(1048576)),
             (
-                r#"{"exec":{"output_buffer_bytes":null}}"#,
-                "{}",
-                serde_json::Value::Null,
+                "output_limit",
+                json!({"output_limit": null}),
+                json!({}),
+                Value::Null,
             ),
             (
-                r#"{"exec":{"output_buffer_bytes":65536}}"#,
-                "{}",
-                serde_json::json!(65536),
+                "output_limit",
+                json!({"output_limit": 65536}),
+                json!({}),
+                json!(65536),
             ),
             (
-                r#"{"exec":{"output_buffer_bytes":0}}"#,
-                r#"{"exec":{"output_buffer_bytes":1048576}}"#,
-                serde_json::json!(1048576),
+                "output_limit",
+                json!({"output_limit": 0}),
+                json!({"output_limit": 1048576}),
+                json!(1048576),
             ),
             (
-                r#"{"exec":{"output_buffer_bytes":1048576}}"#,
-                r#"{"exec":{"output_buffer_bytes":null}}"#,
-                serde_json::Value::Null,
+                "output_limit",
+                json!({"output_limit": 1048576}),
+                json!({"output_limit": null}),
+                Value::Null,
+            ),
+            ("input_limit", json!({}), json!({}), json!(65536)),
+            (
+                "input_limit",
+                json!({"input_limit": 16384}),
+                json!({}),
+                json!(16384),
             ),
             (
-                r#"{"exec":{"output_buffer_bytes":null}}"#,
-                r#"{"exec":{"output_buffer_bytes":65536}}"#,
-                serde_json::json!(65536),
+                "input_limit",
+                json!({"input_limit": 0}),
+                json!({"input_limit": 32768}),
+                json!(32768),
             ),
         ] {
             let layers = BackendConfig::new(
-                serde_json::from_str(user).unwrap(),
-                serde_json::from_str(managed).unwrap(),
+                serde_json::from_value(json!({"exec": user})).unwrap(),
+                serde_json::from_value(json!({"exec": managed})).unwrap(),
             )
             .prepare_for_local_backend(Default::default())
             .unwrap();
             assert_eq!(
-                serde_json::to_value(&layers.resolved_config().exec).unwrap()["output_buffer_bytes"],
+                serde_json::to_value(&layers.resolved_config().exec).unwrap()[field],
                 expected,
-                "user={user}, managed={managed}",
+                "field={field}, user={user}, managed={managed}",
             );
         }
 
-        for limit in [0, 65535] {
-            let user =
-                serde_json::from_value(serde_json::json!({"exec":{"output_buffer_bytes":limit}}))
-                    .unwrap();
-            assert!(
-                BackendConfig::new(user, Default::default())
-                    .prepare_for_local_backend(Default::default())
-                    .is_err()
-            );
+        for (field, limits) in [
+            ("output_limit", vec![0, 65535]),
+            ("input_limit", vec![0, 16383, 65537]),
+        ] {
+            for limit in limits {
+                let user = serde_json::from_value(json!({"exec": {field: limit}})).unwrap();
+                assert!(
+                    BackendConfig::new(user, Default::default())
+                        .prepare_for_local_backend(Default::default())
+                        .is_err()
+                );
+            }
         }
     }
 
