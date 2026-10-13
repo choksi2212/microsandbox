@@ -910,6 +910,12 @@ fn run(
         required: placement_required,
         numa_topology: resolved_numa_topology,
     };
+    // Reclaims the runtime-owned bootstrap rootfs directories if this run
+    // returns before the VM takes over; `enter()` never returns on success,
+    // so normal teardown is handled by the exit observer alone.
+    let mut trampoline_rootfs = TrampolineRootfsGuard {
+        rootfs_dirs: Vec::new(),
+    };
     let build_result = build_vm(
         &config,
         console_backends,
@@ -1055,6 +1061,7 @@ fn run(
         },
         host_placement,
         writeback_limit.as_ref(),
+        &mut trampoline_rootfs.rootfs_dirs,
     );
     let (
         vm,
@@ -1834,6 +1841,7 @@ struct VmBuildRuntime {
     startup_progress: crate::startup_progress::StartupProgressCallback,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_vm(
     config: &Config,
     console_backends: AgentConsoleBackends,
@@ -1842,6 +1850,7 @@ fn build_vm(
     runtime: VmBuildRuntime,
     host_placement: HostPlacement<'_>,
     writeback_limit: Option<&msb_krun::WritebackLimit>,
+    trampoline_rootfs_dirs: &mut Vec<PathBuf>,
 ) -> RuntimeResult<VmBuildOutput> {
     let VmBuildRuntime {
         tokio_handle,
@@ -1856,6 +1865,11 @@ fn build_vm(
     let agent_queue_size = agent_primary_queue_size(bulk_console_backend.is_some());
     let vm = &config.vm;
     let mut owned_directory_checkpoints = std::collections::BTreeMap::new();
+    // Collects the runtime-owned bootstrap rootfs directories created for
+    // unix block-root sandboxes; the caller reclaims them if this VM is
+    // never started, and the exit observer reclaims them at teardown.
+    #[cfg(not(unix))]
+    let _ = trampoline_rootfs_dirs;
     // Decode once before constructing devices: unavailable disks need the exact
     // captured capacity/features, never guessed geometry or a temporary backing.
     let prepared_restore = vm
@@ -1955,7 +1969,8 @@ fn build_vm(
         // EROFS fsmerge OCI rootfs: VMDK (read-only) + upper.ext4 (writable).
         #[cfg(unix)]
         {
-            let backend = bootstrap_trampoline_backend(vm.fs_state_limit())?;
+            let (backend, rootfs_dir) = bootstrap_trampoline_backend(vm.fs_state_limit())?;
+            trampoline_rootfs_dirs.push(rootfs_dir);
             builder = builder.fs(move |fs| fs.tag("/dev/root").custom(Box::new(backend)));
         }
         #[cfg(windows)]
@@ -2004,7 +2019,8 @@ fn build_vm(
     } else if vm.rootfs_disk_spec.is_some() || vm.rootfs_disk.is_some() {
         #[cfg(unix)]
         {
-            let backend = bootstrap_trampoline_backend(vm.fs_state_limit())?;
+            let (backend, rootfs_dir) = bootstrap_trampoline_backend(vm.fs_state_limit())?;
+            trampoline_rootfs_dirs.push(rootfs_dir);
             builder = builder.fs(move |fs| fs.tag("/dev/root").custom(Box::new(backend)));
         }
         #[cfg(windows)]
@@ -2705,7 +2721,11 @@ fn build_vm(
         });
     }
 
-    // Exit observer — runs synchronously before _exit() for DB cleanup.
+    // Exit observer — runs synchronously before _exit() for DB cleanup. On
+    // unix it also reclaims the runtime-owned bootstrap rootfs first, so the
+    // host does not accumulate one leaked trampoline directory per run.
+    #[cfg(unix)]
+    let on_exit = trampoline_rootfs_cleanup_on_exit(trampoline_rootfs_dirs.clone(), on_exit);
     builder = builder.on_placement(on_placement).on_exit(on_exit);
 
     let mut vm = builder
@@ -2932,7 +2952,7 @@ fn macos_maxfilesperproc() -> Option<libc::rlim_t> {
 /// A restored virtio-fs session retains their inode numbers, so the destination
 /// provider must recreate the same pathname namespace before backend restore.
 #[cfg(unix)]
-fn bootstrap_trampoline_backend(limit: usize) -> RuntimeResult<PassthroughFs> {
+fn bootstrap_trampoline_backend(limit: usize) -> RuntimeResult<(PassthroughFs, PathBuf)> {
     let trampoline = tempfile::tempdir()?;
     for directory in ["dev", "sys", "proc", ".msb", "newroot"] {
         std::fs::create_dir(trampoline.path().join(directory)).map_err(|error| {
@@ -2947,8 +2967,75 @@ fn bootstrap_trampoline_backend(limit: usize) -> RuntimeResult<PassthroughFs> {
     };
     let backend = PassthroughFs::new(cfg)
         .map_err(|error| RuntimeError::Custom(format!("trampoline rootfs: {error}")))?;
+    // keep() disables the TempDir auto-cleanup so the bootstrap rootfs
+    // outlives this function; the caller owns reclamation from here on
+    // (see `TrampolineRootfsGuard` and the exit-observer chaining in
+    // `build_vm`).
+    let rootfs_dir = trampoline.path().to_path_buf();
     let _ = trampoline.keep();
-    Ok(backend)
+    Ok((backend, rootfs_dir))
+}
+
+/// Remove runtime-owned bootstrap rootfs directories (see
+/// `bootstrap_trampoline_backend`).
+///
+/// An already-removed directory is success: the exit observer and the
+/// failure-path guard may both attempt reclamation, and forced teardown can
+/// race the host temporary-directory maintenance. No directory is created on
+/// non-unix platforms, so this is a no-op there.
+fn remove_trampoline_rootfs_dirs(rootfs_dirs: &[PathBuf]) {
+    #[cfg(unix)]
+    {
+        for rootfs_dir in rootfs_dirs {
+            if let Err(error) = std::fs::remove_dir_all(rootfs_dir)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    ?error,
+                    ?rootfs_dir,
+                    "failed to remove bootstrap trampoline rootfs"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = rootfs_dirs;
+    }
+}
+
+/// Chain bootstrap rootfs reclamation in front of the exit observer.
+///
+/// The observer runs synchronously on the VMM thread before `_exit()`, so the
+/// runtime-owned directories are reclaimed on both normal and forced teardown
+/// while the original cleanup (DB state, sockets) still runs last.
+#[cfg(unix)]
+fn trampoline_rootfs_cleanup_on_exit(
+    rootfs_dirs: Vec<PathBuf>,
+    on_exit: impl Fn(i32) + Send + 'static,
+) -> impl Fn(i32) + Send + 'static {
+    move |exit_code: i32| {
+        remove_trampoline_rootfs_dirs(&rootfs_dirs);
+        on_exit(exit_code)
+    }
+}
+
+/// Reclaim runtime-owned bootstrap rootfs directories when a sandbox run
+/// ends without the VM having torn them down itself.
+///
+/// `Vm::enter()` never returns on success: the VMM calls `_exit()` on guest
+/// shutdown after the exit observer already reclaimed the directories, so
+/// this drop only runs on failure paths that return before the guest takes
+/// over (including `?` propagation). Reclamation is idempotent, so racing
+/// the exit observer is harmless.
+struct TrampolineRootfsGuard {
+    rootfs_dirs: Vec<PathBuf>,
+}
+
+impl Drop for TrampolineRootfsGuard {
+    fn drop(&mut self) {
+        remove_trampoline_rootfs_dirs(&self.rootfs_dirs);
+    }
 }
 
 /// Recreate runtime-owned paths whose guest-visible inode identities survive a full restore.
@@ -3756,10 +3843,12 @@ mod tests {
     use super::{
         BindIdentityMapRegistration, PARENT_WATCH_DETACH, ParentWatchdogSignal,
         bind_identity_map_for_mount, bootstrap_trampoline_backend, read_parent_watchdog_signal,
+        trampoline_rootfs_cleanup_on_exit,
     };
     use super::{
-        DiskMountSpec, UpperLayerSpec, UpperSpec, prepare_runtime_restore_namespace,
-        recover_owned_disk_layers, validate_disk_mount_layers, validate_upper_layers,
+        DiskMountSpec, TrampolineRootfsGuard, UpperLayerSpec, UpperSpec,
+        prepare_runtime_restore_namespace, recover_owned_disk_layers,
+        remove_trampoline_rootfs_dirs, validate_disk_mount_layers, validate_upper_layers,
     };
 
     use microsandbox_filesystem::{Context, DynFileSystem, FsOptions};
@@ -4083,13 +4172,73 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bootstrap_trampoline_recreates_agent_mountpoints() {
-        let fs =
+        let (fs, rootfs_dir) =
             bootstrap_trampoline_backend(msb_krun::DEFAULT_MAX_FS_BACKEND_STATE_BYTES).unwrap();
         fs.init(FsOptions::empty()).unwrap();
         for directory in ["dev", "sys", "proc", ".msb", "newroot"] {
             fs.lookup(fs_context(), 1, &std::ffi::CString::new(directory).unwrap())
                 .unwrap();
+            assert!(rootfs_dir.join(directory).is_dir());
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trampoline_rootfs_cleanup_on_exit_removes_dir_before_running_observer() {
+        let host = tempfile::tempdir().unwrap();
+        let rootfs_dir = host.path().join("bootstrap-rootfs");
+        std::fs::create_dir_all(rootfs_dir.join("newroot")).unwrap();
+
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+        let observer_seen_cleanup = Arc::new(std::sync::Mutex::new(false));
+        let cleanup_seen = Arc::clone(&observer_seen_cleanup);
+        let cleanup_observed = Arc::clone(&observed);
+        let closure_dir = rootfs_dir.clone();
+        let cleanup =
+            trampoline_rootfs_cleanup_on_exit(vec![rootfs_dir.clone()], move |exit_code| {
+                assert!(
+                    !closure_dir.exists(),
+                    "trampoline rootfs must be reclaimed before the exit observer runs"
+                );
+                *cleanup_seen.lock().unwrap() = true;
+                cleanup_observed.lock().unwrap().push(exit_code);
+            });
+        cleanup(7);
+
+        assert!(!rootfs_dir.exists());
+        assert!(*observer_seen_cleanup.lock().unwrap());
+        assert_eq!(*observed.lock().unwrap(), vec![7]);
+        // Only the runtime-owned rootfs is reclaimed, not its host parent.
+        assert!(host.path().is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_trampoline_rootfs_dirs_tolerates_missing_directories() {
+        let host = tempfile::tempdir().unwrap();
+        let rootfs_dir = host.path().join("bootstrap-rootfs");
+        // No directories, and a path that never existed, are tolerated.
+        remove_trampoline_rootfs_dirs(&[]);
+        remove_trampoline_rootfs_dirs(std::slice::from_ref(&rootfs_dir));
+        std::fs::create_dir_all(rootfs_dir.join("dev")).unwrap();
+        std::fs::write(rootfs_dir.join("dev").join("file"), b"fixture").unwrap();
+        remove_trampoline_rootfs_dirs(std::slice::from_ref(&rootfs_dir));
+        assert!(!rootfs_dir.exists());
+        // Repeated reclamation after a real removal is still not an error.
+        remove_trampoline_rootfs_dirs(std::slice::from_ref(&rootfs_dir));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trampoline_rootfs_guard_reclaims_dirs_on_failure_paths() {
+        let host = tempfile::tempdir().unwrap();
+        let rootfs_dir = host.path().join("bootstrap-rootfs");
+        std::fs::create_dir_all(rootfs_dir.join("newroot")).unwrap();
+        let guard = TrampolineRootfsGuard {
+            rootfs_dirs: vec![rootfs_dir.clone()],
+        };
+        drop(guard);
+        assert!(!rootfs_dir.exists());
     }
 
     #[test]
