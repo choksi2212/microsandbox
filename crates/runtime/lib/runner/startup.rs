@@ -46,7 +46,7 @@ pub(crate) async fn run_startup_command(
         rows: 24,
         cols: 80,
         rlimits: Vec::new(),
-        output_window: None,
+        output_window_bytes: None,
     };
 
     let mut rx = client

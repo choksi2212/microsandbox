@@ -919,7 +919,7 @@ impl ExecSession {
         process_manager: &Arc<ProcessManager>,
         workload_placement: Option<WorkloadPlacement>,
     ) -> AgentdResult<Self> {
-        let output_window = OutputWindow::new(req.output_window)?;
+        let output_window = OutputWindow::new(req.output_window_bytes)?;
         let pty = pty::openpty(None, None)?;
         let err_pipe = new_exec_error_pipe()?;
 
@@ -1162,7 +1162,7 @@ impl ExecSession {
         process_manager: &Arc<ProcessManager>,
         workload_placement: Option<WorkloadPlacement>,
     ) -> AgentdResult<Self> {
-        let output_window = OutputWindow::new(req.output_window)?;
+        let output_window = OutputWindow::new(req.output_window_bytes)?;
         let mut cmd = Command::new(&req.cmd);
         cmd.args(&req.args)
             .stdin(Stdio::piped())
@@ -2146,7 +2146,7 @@ mod tests {
 
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            output_window: None,
+            output_window_bytes: None,
             cmd: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), "sleep 30 & echo $!".to_string()],
             env: Vec::new(),
@@ -2291,7 +2291,7 @@ mod tests {
                 let _runtime = handle.enter();
                 let code = 20 + offset as i32;
                 let req = ExecRequest {
-                    output_window: None,
+                    output_window_bytes: None,
                     cmd: "/bin/sh".to_string(),
                     args: vec!["-c".to_string(), format!("exit {code}")],
                     env: Vec::new(),
@@ -2381,7 +2381,7 @@ mod tests {
     async fn run_single_pipe_spawn(id: u32, code: i32) {
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            output_window: None,
+            output_window_bytes: None,
             cmd: "/bin/sh".to_string(),
             args: vec!["-c".to_string(), format!("exit {code}")],
             env: Vec::new(),
@@ -2547,7 +2547,7 @@ mod tests {
             for profile in [SecurityProfile::Default, SecurityProfile::Restricted] {
                 let (tx, mut rx) = SessionOutputSender::channel();
                 let req = ExecRequest {
-                    output_window: None,
+                    output_window_bytes: None,
                     cmd: std::env::current_exe().unwrap().to_str().unwrap().into(),
                     args: vec![
                         "--exact".into(),
@@ -2616,7 +2616,7 @@ mod tests {
     async fn test_pty_reader_drains_ready_fd() {
         let (tx, mut rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            output_window: None,
+            output_window_bytes: None,
             cmd: "/bin/sh".to_string(),
             args: vec![
                 "-c".to_string(),
@@ -2685,7 +2685,7 @@ mod tests {
     #[test]
     fn test_request_user_overrides_config_default() {
         let req = ExecRequest {
-            output_window: None,
+            output_window_bytes: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2704,7 +2704,7 @@ mod tests {
     #[test]
     fn test_config_default_user_used_when_request_has_none() {
         let req = ExecRequest {
-            output_window: None,
+            output_window_bytes: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2728,7 +2728,7 @@ mod tests {
     #[test]
     fn test_request_without_user_does_not_apply_user_switch() {
         let req = ExecRequest {
-            output_window: None,
+            output_window_bytes: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2753,7 +2753,7 @@ mod tests {
     #[test]
     fn test_default_home_dir_uses_resolved_user_home() {
         let req = ExecRequest {
-            output_window: None,
+            output_window_bytes: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2783,7 +2783,7 @@ mod tests {
     #[test]
     fn test_default_home_dir_uses_root_when_user_absent() {
         let req = ExecRequest {
-            output_window: None,
+            output_window_bytes: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: Vec::new(),
@@ -2808,7 +2808,7 @@ mod tests {
     #[test]
     fn test_default_home_dir_respects_explicit_home_env() {
         let req = ExecRequest {
-            output_window: None,
+            output_window_bytes: None,
             cmd: "/bin/true".to_string(),
             args: Vec::new(),
             env: vec!["HOME=/tmp/custom".to_string()],
@@ -2837,7 +2837,7 @@ mod tests {
     async fn test_spawn_pipe_error_does_not_include_probe_details() {
         let (tx, _rx) = SessionOutputSender::channel();
         let req = ExecRequest {
-            output_window: None,
+            output_window_bytes: None,
             cmd: "/definitely/not/a/real/binary".to_string(),
             args: Vec::new(),
             env: Vec::new(),

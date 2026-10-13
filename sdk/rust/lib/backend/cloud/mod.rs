@@ -561,17 +561,18 @@ mod tests {
             (serde_json::json!(0), serde_json::json!({}), false),
             (
                 serde_json::json!(0),
-                serde_json::json!({"exec":{"buffer_bytes":65536}}),
+                serde_json::json!({"exec":{"output_buffer_bytes":65536}}),
                 true,
             ),
             (
                 serde_json::json!(65536),
-                serde_json::json!({"exec":{"buffer_bytes":0}}),
+                serde_json::json!({"exec":{"output_buffer_bytes":0}}),
                 false,
             ),
         ] {
             let sources = BackendConfig::new(
-                serde_json::from_value(serde_json::json!({"exec":{"buffer_bytes":user}})).unwrap(),
+                serde_json::from_value(serde_json::json!({"exec":{"output_buffer_bytes":user}}))
+                    .unwrap(),
                 serde_json::from_value(managed).unwrap(),
             );
             let result = CloudBackend::builder()

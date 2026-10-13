@@ -218,7 +218,7 @@ async def test_rlimits_reject_raw_dicts(sandbox_factory):
 @pytest.mark.asyncio
 async def test_exec_stream_backpressure_preserves_output(sandbox_factory, tmp_path, monkeypatch):
     config = tmp_path / "config.json"
-    config.write_text('{"exec":{"buffer_bytes":65536}}')
+    config.write_text('{"exec":{"output_buffer_bytes":65536}}')
     monkeypatch.setenv("MSB_CONFIG_PATH", str(config))
     with backend_scope(BackendKind.LOCAL):
         sandbox = await sandbox_factory("py-sdk-backpressure")

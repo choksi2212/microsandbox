@@ -99,7 +99,7 @@ pub struct ExitStatus {
 
 /// Handle to a streaming exec session.
 ///
-/// Output buffering is unlimited by default. When `exec.buffer_bytes` is set,
+/// Output buffering is unlimited by default. When `exec.output_buffer_bytes` is set,
 /// supported guests wait on a full buffer until output is consumed. Older guests
 /// warn and retain unlimited buffering. Collection is not size-limited.
 pub struct ExecHandle {
@@ -637,10 +637,10 @@ pub(crate) mod agent {
     ) -> MicrosandboxResult<ExecHandle> {
         let output_config = super::output::configuration(backend)?;
         let client = Arc::new(super::super::fs::agent::connect_agent(backend, name).await?);
-        let controlled =
-            output_config.buffer_bytes.is_some() && client.supports(MessageType::ExecOutputCredit);
-        if output_config.buffer_bytes.is_some() && !controlled {
-            tracing::warn!(sandbox = %name, "guest does not support exec output backpressure; retaining legacy unbounded buffering (exec.buffer_bytes is not enforced)");
+        let controlled = output_config.output_buffer_bytes.is_some()
+            && client.supports(MessageType::ExecOutputCredit);
+        if output_config.output_buffer_bytes.is_some() && !controlled {
+            tracing::warn!(sandbox = %name, "guest does not support exec output backpressure; retaining legacy unbounded buffering (exec.output_buffer_bytes is not enforced)");
         }
         let ExecOptions {
             args,
@@ -684,7 +684,7 @@ pub(crate) mod agent {
         let mut req = build_exec_request(
             config, cmd, args, cwd, user, &env, &rlimits, tty, rows, cols,
         );
-        req.output_window = output_config.buffer_bytes.filter(|_| controlled);
+        req.output_window_bytes = output_config.output_buffer_bytes.filter(|_| controlled);
         let (id, rx) = client.stream(MessageType::ExecRequest, &req).await?;
 
         let input_window = controlled.then(super::input::InputWindow::new);
@@ -1040,7 +1040,7 @@ pub(crate) mod agent {
             for controlled in [false, true] {
                 let (client, mut peer) = flow_test_client().await;
                 let request: ExecRequest = serde_json::from_value(
-                    serde_json::json!({"cmd":"cat", "output_window":controlled.then_some(65536)}),
+                    serde_json::json!({"cmd":"cat", "output_window_bytes":controlled.then_some(65536)}),
                 )
                 .unwrap();
                 let ((id, rx), _) = tokio::join!(

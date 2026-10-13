@@ -64,7 +64,7 @@ pub struct ExecRequest {
     /// Each chunk costs its payload length plus `EXEC_OUTPUT_EVENT_OVERHEAD`.
     /// Omission preserves unthrottled output for older SDKs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_window: Option<u32>,
+    pub output_window_bytes: Option<u32>,
 }
 
 /// A POSIX resource limit to apply to a spawned process.

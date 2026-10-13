@@ -324,28 +324,28 @@ mod tests {
         for (user, managed, expected) in [
             ("{}", "{}", serde_json::Value::Null),
             (
-                r#"{"exec":{"buffer_bytes":null}}"#,
+                r#"{"exec":{"output_buffer_bytes":null}}"#,
                 "{}",
                 serde_json::Value::Null,
             ),
             (
-                r#"{"exec":{"buffer_bytes":65536}}"#,
+                r#"{"exec":{"output_buffer_bytes":65536}}"#,
                 "{}",
                 serde_json::json!(65536),
             ),
             (
-                r#"{"exec":{"buffer_bytes":0}}"#,
-                r#"{"exec":{"buffer_bytes":1048576}}"#,
+                r#"{"exec":{"output_buffer_bytes":0}}"#,
+                r#"{"exec":{"output_buffer_bytes":1048576}}"#,
                 serde_json::json!(1048576),
             ),
             (
-                r#"{"exec":{"buffer_bytes":1048576}}"#,
-                r#"{"exec":{"buffer_bytes":null}}"#,
+                r#"{"exec":{"output_buffer_bytes":1048576}}"#,
+                r#"{"exec":{"output_buffer_bytes":null}}"#,
                 serde_json::Value::Null,
             ),
             (
-                r#"{"exec":{"buffer_bytes":null}}"#,
-                r#"{"exec":{"buffer_bytes":65536}}"#,
+                r#"{"exec":{"output_buffer_bytes":null}}"#,
+                r#"{"exec":{"output_buffer_bytes":65536}}"#,
                 serde_json::json!(65536),
             ),
         ] {
@@ -356,7 +356,7 @@ mod tests {
             .prepare_for_local_backend(Default::default())
             .unwrap();
             assert_eq!(
-                serde_json::to_value(&layers.resolved_config().exec).unwrap()["buffer_bytes"],
+                serde_json::to_value(&layers.resolved_config().exec).unwrap()["output_buffer_bytes"],
                 expected,
                 "user={user}, managed={managed}",
             );
@@ -364,7 +364,8 @@ mod tests {
 
         for limit in [0, 65535] {
             let user =
-                serde_json::from_value(serde_json::json!({"exec":{"buffer_bytes":limit}})).unwrap();
+                serde_json::from_value(serde_json::json!({"exec":{"output_buffer_bytes":limit}}))
+                    .unwrap();
             assert!(
                 BackendConfig::new(user, Default::default())
                     .prepare_for_local_backend(Default::default())

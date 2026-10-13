@@ -59,19 +59,7 @@ Generation labels must be checked against actual historical agents. The current 
 
 ### Execution output credit (generation 10)
 
-`core.exec.output.credit` returns cumulative consumed output bytes, including a
-256-byte charge per stdout/stderr chunk. An optional `output_window` in
-`core.exec.request` opts into this contract; omission keeps historical behavior
-for old SDKs and the unlimited default. New SDKs send this field and credits only
-when `exec.buffer_bytes` is set and generation 10 is negotiated. Against older
-guests they preserve historical buffering and warn only if a configured bound
-cannot be enforced; no restart or refusal is required.
-Negotiated executions also bound stdin to 64 KiB and return cumulative
-`core.exec.stdin.credit` after writing to the child. This prevents queued stdin
-from blocking the output-credit messages needed to advance a full-duplex command.
-A duplicate acknowledgement returns no extra capacity, and backwards or unsent
-offsets are rejected. Guest output readers wait independently of the control
-loop. Terminal events remain ordered after all output.
+`core.exec.output.credit` returns cumulative consumed output bytes, including a 256-byte charge per stdout/stderr chunk. An optional `output_window_bytes` in `core.exec.request` opts into this contract; omission keeps historical behavior for old SDKs and the unlimited default. New SDKs send this field and credits only when `exec.output_buffer_bytes` is set and generation 10 is negotiated. Against older guests they preserve historical buffering and warn only if a configured bound cannot be enforced; no restart or refusal is required. Negotiated executions also bound stdin to 64 KiB and return cumulative `core.exec.stdin.credit` after writing to the child. This prevents queued stdin from blocking the output-credit messages needed to advance a full-duplex command. A duplicate acknowledgement returns no extra capacity, and backwards or unsent offsets are rejected. Guest output readers wait independently of the control loop. Terminal events remain ordered after all output.
 
 ### Bootstrap and shutdown
 

@@ -19,7 +19,7 @@ pub struct ExecConfig {
     ///
     /// Defaults to `None` (unlimited). A limit must be at least 64 KiB. Stdout and
     /// stderr share it; output retained by callers and transport buffers is excluded.
-    pub buffer_bytes: Option<u32>,
+    pub output_buffer_bytes: Option<u32>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -29,11 +29,11 @@ pub struct ExecConfig {
 impl ExecConfig {
     pub(crate) fn validate(&self) -> MicrosandboxResult<()> {
         if self
-            .buffer_bytes
+            .output_buffer_bytes
             .is_some_and(|bytes| bytes < MIN_EXEC_OUTPUT_WINDOW)
         {
             return Err(MicrosandboxError::InvalidConfig(format!(
-                "exec.buffer_bytes must be at least {MIN_EXEC_OUTPUT_WINDOW} bytes"
+                "exec.output_buffer_bytes must be at least {MIN_EXEC_OUTPUT_WINDOW} bytes"
             )));
         }
         Ok(())

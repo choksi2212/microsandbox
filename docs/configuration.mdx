@@ -99,7 +99,7 @@ Relative host paths stored in this file resolve from the file's directory, inclu
     }
   },
   "exec": {
-    "buffer_bytes": null
+    "output_buffer_bytes": null
   },
   "ssh": {
     "inactivity_timeout_secs": 600
@@ -227,17 +227,13 @@ For a long-lived process, construct a new backend to pick up configuration chang
 
 | Field | Default | Description |
 |---|---|---|
-| `buffer_bytes` | `null` (unlimited) | Optional unread output limit per command, shared by stdout and stderr. Minimum: `65536` bytes (64 KiB). |
+| `output_buffer_bytes` | `null` (unlimited) | Optional unread output limit per command, shared by stdout and stderr. Minimum: `65536` bytes (64 KiB). |
 
-With a limit set, a full buffer pauses output until it is read. This does not limit total
-collected output or total process memory. Set it before constructing a backend;
-existing streams keep their original limit.
+With a limit set, a full buffer pauses output until it is read. This does not limit total collected output or total process memory. Set it before constructing a backend; existing streams keep their original limit.
 
-Older guests retain unbounded buffering and warn if a configured limit cannot
-be enforced. They remain usable without restarting.
+Older guests retain unbounded buffering and warn if a configured limit cannot be enforced. They remain usable without restarting.
 
-See [Slow output readers](/sandboxes/commands#slow-output-readers) for how limits
-affect guest writes and concurrent stdin/output.
+See [Slow output readers](/sandboxes/commands#slow-output-readers) for how limits affect guest writes and concurrent stdin/output.
 
 ## `ssh`
 

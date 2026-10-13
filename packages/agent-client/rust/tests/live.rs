@@ -34,7 +34,7 @@ async fn live_existing_agent_preserves_execution_streams_and_filesystem_requests
             rows: 24,
             cols: 80,
             rlimits: vec![],
-            output_window: None,
+            output_window_bytes: None,
         };
         let stream = client
             .stream(TypedMessage::new(MessageType::ExecRequest, &request))
