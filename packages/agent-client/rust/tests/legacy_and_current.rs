@@ -40,6 +40,7 @@ mod tests {
             init_time_ns: 22,
             ready_time_ns: 33,
             agent_version: "9.9.9".to_string(),
+            exec_input_limit_version: None,
         };
         let ready_msg = Message::with_payload(MessageType::Ready, 0, &ready).unwrap();
 
@@ -91,6 +92,7 @@ mod tests {
             init_time_ns: 22,
             ready_time_ns: 33,
             agent_version: "named-pipe-test".to_string(),
+            exec_input_limit_version: None,
         };
         let ready_msg = Message::with_payload(MessageType::Ready, 0, &ready).unwrap();
 
@@ -371,6 +373,7 @@ mod tests {
             init_time_ns: 22,
             ready_time_ns: 33,
             agent_version: "stream-test".to_string(),
+            exec_input_limit_version: None,
         };
         let ready_msg = Message::with_payload(MessageType::Ready, 0, &ready).unwrap();
 
