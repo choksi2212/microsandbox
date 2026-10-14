@@ -4241,6 +4241,250 @@ mod tests {
         assert!(!rootfs_dir.exists());
     }
 
+    /// Minimal `Config` that reaches the trampoline-registering rootfs branches
+    /// of `build_vm`; the caller shapes the rootfs to pin which branch runs.
+    #[cfg(unix)]
+    fn build_vm_test_config(
+        scratch: &std::path::Path,
+        shape_rootfs: impl FnOnce(&mut VmConfig),
+    ) -> super::Config {
+        let mut vm = VmConfig {
+            libkrunfw_path: std::path::PathBuf::from("/nonexistent/libkrunfw.so"),
+            thp: Default::default(),
+            guest_clock: Default::default(),
+            memory_cache_dir: None,
+            vcpus: 1,
+            memory_mib: 256,
+            max_cpus: 1,
+            max_memory_mib: 256,
+            cpu_placement: Default::default(),
+            placement_profile_name: None,
+            placement_profile: None,
+            fs_state_limit_bytes: None,
+            block_writeback_limit_bytes: None,
+            rootfs_path: None,
+            rootfs_follow_root_symlinks: false,
+            rootfs_disk: None,
+            rootfs_disk_format: None,
+            rootfs_disk_readonly: false,
+            rootfs_disk_spec: None,
+            rootfs_disk_runtime_owned: false,
+            rootfs_vmdk: None,
+            rootfs_upper: None,
+            rootfs_upper_spec: None,
+            mounts: Vec::new(),
+            file_mounts: Vec::new(),
+            owned_volumes: Vec::new(),
+            disks: Vec::new(),
+            vsock: Vec::new(),
+            backends: Vec::new(),
+            init_path: None,
+            bootstrap: Default::default(),
+            exec_path: None,
+            exec_args: Vec::new(),
+            #[cfg(feature = "net")]
+            network: Default::default(),
+            #[cfg(feature = "net")]
+            deployment_profile: Default::default(),
+            #[cfg(feature = "net")]
+            sandbox_slot: 1,
+            checkpoint_restore: None,
+        };
+        shape_rootfs(&mut vm);
+        super::Config {
+            agent_transport: AgentTransportProfile::default(),
+            sandbox_name: "trampoline-test".into(),
+            sandbox_id: 1,
+            log_level: None,
+            sandbox_db_path: scratch.join("sandbox.db"),
+            sandbox_db_connect_timeout_secs: 5,
+            log_dir: scratch.join("logs"),
+            runtime_dir: scratch.join("runtime"),
+            sandboxes_dir: scratch.join("sandboxes"),
+            run_dir: scratch.join("run"),
+            lifecycle_guard: crate::ipc::SandboxLifecycleGuard::from_inherited_file(
+                std::fs::File::create(scratch.join("lifecycle.lock")).unwrap(),
+            ),
+            cpu_lease_dir: scratch.join("cpu-leases"),
+            writeback_lease_dir: scratch.join("writeback-leases"),
+            block_writeback_pool_bytes: None,
+            agent_sock_path: scratch.join("agent.sock"),
+            startup_command: None,
+            startup_fd: None,
+            parent_watchdog: None,
+            forward_output: false,
+            idle_timeout_secs: None,
+            max_duration_secs: None,
+            metrics_sample_interval_ms: None,
+            metrics_slot: None,
+            vm,
+        }
+    }
+
+    /// Assert the trampoline `build_vm` registered was created through the
+    /// production bootstrap and is still owned by the caller.
+    #[cfg(unix)]
+    fn registered_trampolines(
+        trampoline_rootfs: &TrampolineRootfsGuard,
+    ) -> Vec<std::path::PathBuf> {
+        let dirs = trampoline_rootfs.rootfs_dirs.clone();
+        assert_eq!(
+            dirs.len(),
+            1,
+            "build_vm must register the trampoline it created"
+        );
+        assert!(
+            dirs[0].is_dir(),
+            "trampoline rootfs must exist while the run owns it"
+        );
+        assert!(
+            dirs[0].join("newroot").is_dir(),
+            "production bootstrap mountpoints must be present"
+        );
+        dirs
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_vm_reclaims_registered_trampoline_after_flat_root_build_failure() {
+        let scratch = tempfile::tempdir().unwrap();
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut trampoline_rootfs = TrampolineRootfsGuard {
+            rootfs_dirs: Vec::new(),
+        };
+        // An empty chain fails validate_upper_layers, which runs after the
+        // flat-root branch created and registered the bootstrap trampoline.
+        let config = build_vm_test_config(scratch.path(), |vm| {
+            vm.rootfs_disk_spec = Some(UpperSpec {
+                layers: Vec::new(),
+                read_only: false,
+            });
+        });
+
+        let result = super::build_vm(
+            &config,
+            super::AgentConsoleBackends {
+                control: crate::runner::console::AgentConsoleBackend::new(Arc::new(
+                    ConsoleSharedState::new(),
+                )),
+                bulk: None,
+            },
+            |_| {},
+            |_: &msb_krun::PlacementReport| {},
+            super::VmBuildRuntime {
+                tokio_handle: tokio_rt.handle().clone(),
+                startup_progress: Arc::new(|_| {}),
+            },
+            super::HostPlacement {
+                vcpu_targets: None,
+                required: false,
+                numa_topology: None,
+            },
+            None,
+            &mut trampoline_rootfs.rootfs_dirs,
+        );
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("empty upper chain must fail the VM build"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("upper block chain must contain at least one layer"),
+            "unexpected build failure: {error}"
+        );
+        let registered = registered_trampolines(&trampoline_rootfs);
+
+        // The failure path the sandbox process takes: build_vm returned Err
+        // before the guest could take over, so dropping the guard reclaims
+        // the registered trampoline.
+        drop(trampoline_rootfs);
+        assert!(
+            !registered[0].exists(),
+            "guard drop after a failed build must reclaim the trampoline"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_vm_exit_callback_removes_registered_trampoline_from_vmdk_build() {
+        let scratch = tempfile::tempdir().unwrap();
+        let tokio_rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let mut trampoline_rootfs = TrampolineRootfsGuard {
+            rootfs_dirs: Vec::new(),
+        };
+        // The VMDK branch registers its trampoline first; an empty upper
+        // chain then fails validate_upper_layers before any guest runs.
+        let config = build_vm_test_config(scratch.path(), |vm| {
+            vm.rootfs_vmdk = Some(scratch.path().join("rootfs.vmdk"));
+            vm.rootfs_upper_spec = Some(UpperSpec {
+                layers: Vec::new(),
+                read_only: false,
+            });
+        });
+
+        let result = super::build_vm(
+            &config,
+            super::AgentConsoleBackends {
+                control: crate::runner::console::AgentConsoleBackend::new(Arc::new(
+                    ConsoleSharedState::new(),
+                )),
+                bulk: None,
+            },
+            |_| {},
+            |_: &msb_krun::PlacementReport| {},
+            super::VmBuildRuntime {
+                tokio_handle: tokio_rt.handle().clone(),
+                startup_progress: Arc::new(|_| {}),
+            },
+            super::HostPlacement {
+                vcpu_targets: None,
+                required: false,
+                numa_topology: None,
+            },
+            None,
+            &mut trampoline_rootfs.rootfs_dirs,
+        );
+
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("empty upper chain must fail the VM build"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("upper block chain must contain at least one layer"),
+            "unexpected build failure: {error}"
+        );
+        let registered = registered_trampolines(&trampoline_rootfs);
+
+        // The exit callback build_vm chains in front of the exit observer
+        // removes the registered trampoline and still runs the observer. The
+        // VM never started on this failure path, so invoke the chained
+        // callback the way the VMM would at guest exit.
+        let observed = Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
+        let seen = Arc::clone(&observed);
+        let chained = trampoline_rootfs_cleanup_on_exit(registered.clone(), move |exit_code| {
+            seen.lock().unwrap().push(exit_code);
+        });
+        chained(3);
+        assert!(
+            !registered[0].exists(),
+            "the registered exit callback must remove the trampoline"
+        );
+        assert_eq!(*observed.lock().unwrap(), vec![3]);
+
+        // Dropping the guard afterwards reclaims idempotently: forced
+        // teardown can race the exit observer.
+        drop(trampoline_rootfs);
+        assert!(!registered[0].exists());
+    }
+
     #[test]
     fn restored_runtime_namespace_matches_root_kind_and_preserves_heartbeat() {
         let oci_runtime = tempfile::tempdir().unwrap();
