@@ -134,6 +134,22 @@ impl RuntimeExit {
             state.birth != self.identity.birth || state.status == libc::SZOMB as u8
         }))
     }
+
+    /// Signal the process proven at capture. Darwin has no pid-scoped signal
+    /// syscall, so the send targets the PID whose birth identity was verified
+    /// under the sandbox transition guard rather than trusting the catalog.
+    pub(super) fn send_signal(&self, signal: libc::c_int) -> io::Result<()> {
+        let result = unsafe { libc::kill(self.pid, signal) };
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        Ok(())
+    }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -198,7 +214,11 @@ fn lifecycle_matches(pid: i32, lifecycle: &Path) -> io::Result<bool> {
     if result <= 0 {
         let error = io::Error::last_os_error();
         return match error.raw_os_error() {
-            Some(libc::ESRCH | libc::EBADF | libc::ENOENT) => Ok(false),
+            // A descriptor belonging to another user's process (EPERM/EACCES)
+            // is by definition not our runtime, exactly like a missing one.
+            Some(libc::ESRCH | libc::EBADF | libc::ENOENT | libc::EPERM | libc::EACCES) => {
+                Ok(false)
+            }
             _ => Err(error),
         };
     }
@@ -208,7 +228,21 @@ fn lifecycle_matches(pid: i32, lifecycle: &Path) -> io::Result<bool> {
         ));
     }
     let info = unsafe { info.assume_init() };
-    let expected = std::fs::metadata(lifecycle)?;
+    let expected = match std::fs::metadata(lifecycle) {
+        Ok(metadata) => metadata,
+        // A run directory without the lifecycle file cannot prove any live
+        // process is this runtime; treat it as unproven instead of failing
+        // the stop or kill of a stale row.
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    };
     Ok((
         u64::from(info.vnode.vi_stat.vst_dev),
         info.vnode.vi_stat.vst_ino,

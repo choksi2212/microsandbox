@@ -39,10 +39,17 @@ impl RuntimeExit {
         );
         let actual = match std::fs::metadata(inherited) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if lifecycle_fd_unreadable(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
-        let expected = std::fs::metadata(lifecycle)?;
+        let expected = match std::fs::metadata(lifecycle) {
+            Ok(metadata) => metadata,
+            // A run directory without the lifecycle file cannot prove any live
+            // process is this runtime; treat it as unproven instead of failing
+            // the stop or kill of a stale row.
+            Err(error) if lifecycle_fd_unreadable(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
         // A stale catalog PID can point to an unrelated process. Require the runtime's
         // inherited lifecycle file, not just a live PID or a terminal database row.
         if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino()) {
@@ -72,6 +79,49 @@ impl RuntimeExit {
         // the leader becoming a zombie is insufficient while workers release shared files.
         Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) != 0)
     }
+
+    /// Signal the pinned process. The handle was captured under the sandbox
+    /// transition guard, so a signal sent through it can only reach the process
+    /// whose inherited lifecycle lock was verified — never a later PID occupant.
+    pub(super) fn send_signal(&self, signal: libc::c_int) -> std::io::Result<()> {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                self.0.as_raw_fd(),
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            // The thread group finished exiting between capture and dispatch,
+            // so the requested signal has no remaining target. Callers converge
+            // the catalog row instead of failing on an already-dead runtime.
+            return if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(error)
+            };
+        }
+        Ok(())
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Lifecycle metadata reads that cannot prove the recorded PID is our
+/// runtime: a process without the inherited lifecycle lock, one whose `/proc`
+/// entry belongs to another user after a restart recycled the PID, or a run
+/// directory whose lock file is gone. None of these identify our runtime, so
+/// capture reports the PID as unproven instead of surfacing the error.
+fn lifecycle_fd_unreadable(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+    )
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -242,5 +292,77 @@ mod tests {
             .is_none()
         );
         assert!(RuntimeExit::capture(None, home.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn lifecycle_fd_unreadable_covers_not_found_and_permission_denied() {
+        assert!(lifecycle_fd_unreadable(&std::io::Error::from_raw_os_error(
+            libc::ENOENT
+        )));
+        assert!(lifecycle_fd_unreadable(&std::io::Error::from_raw_os_error(
+            libc::EACCES
+        )));
+        assert!(!lifecycle_fd_unreadable(
+            &std::io::Error::from_raw_os_error(libc::EIO)
+        ));
+    }
+
+    #[test]
+    fn send_signal_targets_only_the_captured_process() {
+        let home = tempfile::tempdir().unwrap();
+        let lifecycle =
+            microsandbox_runtime::ipc::acquire_lifecycle_guard(home.path(), "signal").unwrap();
+        let lifecycle_fd = lifecycle.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "backend::local::sandbox::process_exit::tests::exit_barrier_child",
+                "--nocapture",
+            ])
+            .env("MSB_EXIT_BARRIER_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        unsafe {
+            command.pre_exec(move || {
+                let copy = libc::fcntl(lifecycle_fd, libc::F_DUPFD_CLOEXEC, 200);
+                if copy < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(copy, microsandbox_runtime::vm::LIFECYCLE_LOCK_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = scopeguard::guard(command.spawn().unwrap(), |mut child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut wait_line = |expected: &str| {
+            loop {
+                let mut line = String::new();
+                assert_ne!(output.read_line(&mut line).unwrap(), 0);
+                if line.trim() == expected {
+                    break;
+                }
+            }
+        };
+        wait_line("ready");
+        let barrier = RuntimeExit::capture(
+            Some(child.id() as i32),
+            &microsandbox_runtime::ipc::lifecycle_lock_path(home.path(), "signal"),
+        )
+        .unwrap()
+        .unwrap();
+        child.stdin.as_mut().unwrap().write_all(b"l").unwrap();
+        wait_line("lifecycle-released");
+        child.stdin.as_mut().unwrap().write_all(b"d").unwrap();
+        wait_line("disk-released");
+        assert!(child.wait().unwrap().success());
+        // The pinned process is gone, so a later occupant of the number must
+        // not receive anything, and the already-exited runtime reports success.
+        assert!(barrier.send_signal(libc::SIGKILL).is_ok());
     }
 }

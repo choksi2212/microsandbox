@@ -362,9 +362,26 @@ impl LocalBackend {
             pid,
             &microsandbox_runtime::ipc::lifecycle_lock_path(&self.config().run_dir(), name),
         )?;
-        if let Some(pid) = pid.filter(|p| Self::pid_is_alive(*p)) {
-            Self::kill_pid(pid)?;
-            pids.push(pid);
+        // A live PID number cannot identify the runtime: after a host restart
+        // the catalog can name whatever process reused the number. Only the
+        // process proven by its inherited lifecycle lock is signalled, and
+        // through the captured handle, so a later PID occupant can never
+        // receive the signal.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            if let (Some(pid), Some(proven)) =
+                (pid.filter(|p| Self::pid_is_alive(*p)), departing.as_ref())
+            {
+                proven.send_signal(libc::SIGKILL)?;
+                pids.push(pid);
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            if let Some(pid) = pid.filter(|p| Self::pid_is_alive(*p)) {
+                Self::kill_pid(pid)?;
+                pids.push(pid);
+            }
         }
 
         if !pids.is_empty() {
@@ -443,10 +460,27 @@ impl LocalBackend {
             Ok(())
         }
 
-        #[cfg(unix)]
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
         {
             if let Some(pid) = pid.filter(|p| Self::pid_is_alive(*p)) {
                 Self::drain_pid(pid)?;
+            }
+            Ok(())
+        }
+
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            // Same ownership rule as kill: the legacy drain signal only reaches
+            // a runtime proven by its inherited lifecycle lock, never whatever
+            // process reused a stale catalog PID after a restart.
+            let departing = process_exit::RuntimeExit::capture(
+                pid,
+                &microsandbox_runtime::ipc::lifecycle_lock_path(&self.config().run_dir(), name),
+            )?;
+            if pid.is_some_and(Self::pid_is_alive)
+                && let Some(proven) = departing.as_ref()
+            {
+                proven.send_signal(libc::SIGUSR1)?;
             }
             Ok(())
         }
@@ -1165,8 +1199,10 @@ impl LocalBackend {
         Self::terminate_pid(pid)
     }
 
-    /// Trigger the legacy drain path (SIGUSR1).
-    #[cfg(unix)]
+    /// Trigger the legacy drain path (SIGUSR1) on platforms without the
+    /// lifecycle-proof machinery. Linux and macOS drain through the proven
+    /// handle instead.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     fn drain_pid(pid: i32) -> MicrosandboxResult<()> {
         nix::sys::signal::kill(
             nix::unistd::Pid::from_raw(pid),
@@ -2529,5 +2565,338 @@ mod tests {
         // Cleanup the live process.
         unsafe { libc::kill(live_pid, libc::SIGKILL) };
         waiter.join().unwrap();
+    }
+
+    /// Child entry for the signal tests: holds the inherited lifecycle lock
+    /// descriptor (when the parent installs one) and waits for its parent
+    /// before exiting.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn lifecycle_signal_child() {
+        use std::io::Read;
+        if std::env::var_os("MSB_LIFECYCLE_SIGNAL_CHILD").is_none() {
+            return;
+        }
+        // Restore default signal semantics no matter how this copy was
+        // spawned: an inherited blocked mask or ignored disposition would let
+        // the child survive a stray SIGUSR1 and hide exactly the bug these
+        // tests pin.
+        unsafe {
+            libc::signal(libc::SIGUSR1, libc::SIG_DFL);
+            let empty: libc::sigset_t = std::mem::zeroed();
+            libc::sigprocmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+        }
+        println!("ready");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        let mut byte = [0];
+        let _ = std::io::stdin().read_exact(&mut byte);
+        std::process::exit(0);
+    }
+
+    /// Backend with Running catalog/run rows recording `pid`, plus a free
+    /// lifecycle lock file: the state a host restart leaves behind when the
+    /// recorded PID has been reused by an unrelated process.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn backend_with_stale_running_pid(
+        home: &std::path::Path,
+        name: &str,
+        pid: i32,
+    ) -> (Arc<LocalBackend>, i32) {
+        let backend = Arc::new(
+            crate::test_support::local_backend_builder(home)
+                .build()
+                .await
+                .unwrap(),
+        );
+        let run_dir = backend.config().run_dir();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        drop(microsandbox_runtime::ipc::acquire_lifecycle_guard(&run_dir, name).unwrap());
+        let pools = backend.db().await.unwrap();
+        let id = LocalBackend::insert_sandbox_record(pools.write(), &test_config(name))
+            .await
+            .unwrap();
+        run_entity::Entity::insert(run_entity::ActiveModel {
+            sandbox_id: Set(id),
+            pid: Set(Some(pid)),
+            status: Set(run_entity::RunStatus::Running),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap();
+        (backend, id)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    async fn recorded_sandbox_status(backend: &LocalBackend, id: i32) -> SandboxStatus {
+        let pools = backend.db().await.unwrap();
+        sandbox_entity::Entity::find_by_id(id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap()
+            .status
+    }
+
+    /// Kill must spare a live PID the backend cannot prove is the runtime.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn kill_sandbox_spares_unrelated_recycled_pid() {
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        // The innocent process is a fresh copy of this test binary: it holds no
+        // lifecycle descriptor, and its runtime resets any inherited signal
+        // mask, so a stray SIGUSR1 cannot be silently swallowed the way a
+        // bare external `sleep` can.
+        let mut innocent_command = Command::new(std::env::current_exe().unwrap());
+        innocent_command
+            .args([
+                "--exact",
+                "backend::local::sandbox::tests::lifecycle_signal_child",
+                "--nocapture",
+            ])
+            .env("MSB_LIFECYCLE_SIGNAL_CHILD", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut innocent = scopeguard::guard(innocent_command.spawn().unwrap(), |mut child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        {
+            use std::io::BufRead;
+            let mut output = std::io::BufReader::new(innocent.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(output.read_line(&mut line).unwrap(), 0);
+                if line.trim() == "ready" {
+                    break;
+                }
+            }
+        }
+        let (backend, id) =
+            backend_with_stale_running_pid(home.path(), "stale", innocent.id() as i32).await;
+        backend.kill_sandbox("stale", None).await.unwrap();
+        assert!(
+            LocalBackend::pid_is_alive(innocent.id() as i32),
+            "a PID the backend cannot prove is the runtime must not receive SIGKILL"
+        );
+        assert_eq!(
+            recorded_sandbox_status(&backend, id).await,
+            SandboxStatus::Stopped
+        );
+    }
+
+    /// Drain must spare a live PID the backend cannot prove is the runtime.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn drain_sandbox_spares_unrelated_recycled_pid() {
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        // The innocent process is a fresh copy of this test binary: it holds no
+        // lifecycle descriptor, and its runtime resets any inherited signal
+        // mask, so a stray SIGUSR1 cannot be silently swallowed the way a
+        // bare external `sleep` can.
+        let mut innocent_command = Command::new(std::env::current_exe().unwrap());
+        innocent_command
+            .args([
+                "--exact",
+                "backend::local::sandbox::tests::lifecycle_signal_child",
+                "--nocapture",
+            ])
+            .env("MSB_LIFECYCLE_SIGNAL_CHILD", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let mut innocent = scopeguard::guard(innocent_command.spawn().unwrap(), |mut child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        {
+            use std::io::BufRead;
+            let mut output = std::io::BufReader::new(innocent.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(output.read_line(&mut line).unwrap(), 0);
+                if line.trim() == "ready" {
+                    break;
+                }
+            }
+        }
+        let (backend, id) =
+            backend_with_stale_running_pid(home.path(), "stale", innocent.id() as i32).await;
+        backend.drain_sandbox("stale", None).await.unwrap();
+        assert!(
+            LocalBackend::pid_is_alive(innocent.id() as i32),
+            "a PID the backend cannot prove is the runtime must not receive SIGUSR1"
+        );
+        assert_eq!(
+            recorded_sandbox_status(&backend, id).await,
+            SandboxStatus::Draining
+        );
+    }
+
+    /// Kill still reaches a runtime proven by its inherited lifecycle lock.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn kill_sandbox_still_kills_a_proven_runtime() {
+        use std::io::BufRead;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        use std::process::Stdio;
+
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let backend = Arc::new(
+            crate::test_support::local_backend_builder(home.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let name = "live";
+        let run_dir = backend.config().run_dir();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let guard = microsandbox_runtime::ipc::acquire_lifecycle_guard(&run_dir, name).unwrap();
+        let guard_fd = guard.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "backend::local::sandbox::tests::lifecycle_signal_child",
+                "--nocapture",
+            ])
+            .env("MSB_LIFECYCLE_SIGNAL_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        unsafe {
+            command.pre_exec(move || {
+                let copy = libc::fcntl(guard_fd, libc::F_DUPFD_CLOEXEC, 200);
+                if copy < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(copy, microsandbox_runtime::vm::LIFECYCLE_LOCK_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = scopeguard::guard(command.spawn().unwrap(), |mut child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        {
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(output.read_line(&mut line).unwrap(), 0);
+                if line.trim() == "ready" {
+                    break;
+                }
+            }
+        }
+        let pools = backend.db().await.unwrap();
+        let id = LocalBackend::insert_sandbox_record(pools.write(), &test_config(name))
+            .await
+            .unwrap();
+        run_entity::Entity::insert(run_entity::ActiveModel {
+            sandbox_id: Set(id),
+            pid: Set(Some(child.id() as i32)),
+            status: Set(run_entity::RunStatus::Running),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap();
+        backend.kill_sandbox(name, None).await.unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "the proven runtime must still receive the kill signal"
+        );
+        assert_eq!(
+            recorded_sandbox_status(&backend, id).await,
+            SandboxStatus::Stopped
+        );
+    }
+
+    /// Drain still reaches a runtime proven by its inherited lifecycle lock.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn drain_sandbox_still_drains_a_proven_runtime() {
+        use std::io::BufRead;
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        use std::process::Stdio;
+
+        let home = tempfile::tempdir_in("/tmp").unwrap();
+        let backend = Arc::new(
+            crate::test_support::local_backend_builder(home.path())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let name = "live";
+        let run_dir = backend.config().run_dir();
+        std::fs::create_dir_all(&run_dir).unwrap();
+        let guard = microsandbox_runtime::ipc::acquire_lifecycle_guard(&run_dir, name).unwrap();
+        let guard_fd = guard.as_raw_fd();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "backend::local::sandbox::tests::lifecycle_signal_child",
+                "--nocapture",
+            ])
+            .env("MSB_LIFECYCLE_SIGNAL_CHILD", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped());
+        unsafe {
+            command.pre_exec(move || {
+                let copy = libc::fcntl(guard_fd, libc::F_DUPFD_CLOEXEC, 200);
+                if copy < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::dup2(copy, microsandbox_runtime::vm::LIFECYCLE_LOCK_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = scopeguard::guard(command.spawn().unwrap(), |mut child| {
+            let _ = child.kill();
+            let _ = child.wait();
+        });
+        {
+            let mut output = std::io::BufReader::new(child.stdout.take().unwrap());
+            let mut line = String::new();
+            loop {
+                line.clear();
+                assert_ne!(output.read_line(&mut line).unwrap(), 0);
+                if line.trim() == "ready" {
+                    break;
+                }
+            }
+        }
+        let pools = backend.db().await.unwrap();
+        let id = LocalBackend::insert_sandbox_record(pools.write(), &test_config(name))
+            .await
+            .unwrap();
+        run_entity::Entity::insert(run_entity::ActiveModel {
+            sandbox_id: Set(id),
+            pid: Set(Some(child.id() as i32)),
+            status: Set(run_entity::RunStatus::Running),
+            ..Default::default()
+        })
+        .exec(pools.write())
+        .await
+        .unwrap();
+        backend.drain_sandbox(name, None).await.unwrap();
+        let status = child.wait().unwrap();
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGUSR1),
+            "the proven runtime must still receive the drain signal"
+        );
+        assert_eq!(
+            recorded_sandbox_status(&backend, id).await,
+            SandboxStatus::Draining
+        );
     }
 }
