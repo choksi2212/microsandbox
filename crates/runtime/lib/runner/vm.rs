@@ -3004,6 +3004,17 @@ fn remove_trampoline_rootfs_dirs(rootfs_dirs: &[PathBuf]) {
     }
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    /// Directories each [`trampoline_rootfs_cleanup_on_exit`] call was asked
+    /// to reclaim, per thread. Tests only: msb_krun stores the installed
+    /// observer privately and runs it from `Vm::enter()` after `load_krunfw()`,
+    /// so this ledger is the only way a unit test can observe which
+    /// directories `build_vm` wired into the exit path.
+    static EXIT_CLEANUP_WIRING: std::cell::RefCell<Vec<Vec<PathBuf>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Chain bootstrap rootfs reclamation in front of the exit observer.
 ///
 /// The observer runs synchronously on the VMM thread before `_exit()`, so the
@@ -3014,6 +3025,8 @@ fn trampoline_rootfs_cleanup_on_exit(
     rootfs_dirs: Vec<PathBuf>,
     on_exit: impl Fn(i32) + Send + 'static,
 ) -> impl Fn(i32) + Send + 'static {
+    #[cfg(test)]
+    EXIT_CLEANUP_WIRING.with(|wiring| wiring.borrow_mut().push(rootfs_dirs.clone()));
     move |exit_code: i32| {
         remove_trampoline_rootfs_dirs(&rootfs_dirs);
         on_exit(exit_code)
@@ -3841,9 +3854,9 @@ mod tests {
     };
     #[cfg(unix)]
     use super::{
-        BindIdentityMapRegistration, PARENT_WATCH_DETACH, ParentWatchdogSignal,
-        bind_identity_map_for_mount, bootstrap_trampoline_backend, read_parent_watchdog_signal,
-        trampoline_rootfs_cleanup_on_exit,
+        BindIdentityMapRegistration, EXIT_CLEANUP_WIRING, PARENT_WATCH_DETACH,
+        ParentWatchdogSignal, bind_identity_map_for_mount, bootstrap_trampoline_backend,
+        read_parent_watchdog_signal, trampoline_rootfs_cleanup_on_exit,
     };
     use super::{
         DiskMountSpec, TrampolineRootfsGuard, UpperLayerSpec, UpperSpec,
@@ -4180,6 +4193,12 @@ mod tests {
                 .unwrap();
             assert!(rootfs_dir.join(directory).is_dir());
         }
+
+        // `bootstrap_trampoline_backend` `keep()`s its TempDir, so hand the
+        // bootstrap rootfs back through the production reclamation path
+        // instead of leaving it in the host temp tree on every test run.
+        remove_trampoline_rootfs_dirs(std::slice::from_ref(&rootfs_dir));
+        assert!(!rootfs_dir.exists());
     }
 
     #[cfg(unix)]
@@ -4408,9 +4427,19 @@ mod tests {
         );
     }
 
+    /// A valid VMDK + upper-chain config drives `build_vm` all the way
+    /// through the exit wiring: the registered trampoline must be handed to
+    /// the exit-cleanup wrapper, and the build must proceed past that wiring
+    /// (it either succeeds, or fails inside the msb_krun builder, never in
+    /// the layer validation that runs before the wiring). Firing the
+    /// installed observer itself needs a live VMM: msb_krun stores it
+    /// privately and runs it from `Vm::enter()` after `load_krunfw()`, so the
+    /// callback's behavior is pinned separately by
+    /// `trampoline_rootfs_cleanup_on_exit_removes_dir_before_running_observer`
+    /// on the exact closure this wiring installs.
     #[cfg(unix)]
     #[test]
-    fn build_vm_exit_callback_removes_registered_trampoline_from_vmdk_build() {
+    fn build_vm_wires_registered_trampoline_into_exit_observer() {
         let scratch = tempfile::tempdir().unwrap();
         let tokio_rt = tokio::runtime::Builder::new_current_thread()
             .build()
@@ -4418,12 +4447,20 @@ mod tests {
         let mut trampoline_rootfs = TrampolineRootfsGuard {
             rootfs_dirs: Vec::new(),
         };
-        // The VMDK branch registers its trampoline first; an empty upper
-        // chain then fails validate_upper_layers before any guest runs.
+        // A single raw head passes validate_upper_layers, so the VMDK branch
+        // registers its trampoline and the build continues into the exit
+        // wiring instead of failing the chain validation first. The runtime
+        // directory is the caller's contract (see the create_dir_all in the
+        // run setup), so the test creates what production creates.
+        std::fs::create_dir_all(scratch.path().join("runtime")).unwrap();
+        std::fs::create_dir_all(scratch.path().join("runtime").join("scripts")).unwrap();
         let config = build_vm_test_config(scratch.path(), |vm| {
             vm.rootfs_vmdk = Some(scratch.path().join("rootfs.vmdk"));
             vm.rootfs_upper_spec = Some(UpperSpec {
-                layers: Vec::new(),
+                layers: vec![UpperLayerSpec {
+                    path: scratch.path().join("upper.raw"),
+                    format: msb_krun::DiskImageFormat::Raw,
+                }],
                 read_only: false,
             });
         });
@@ -4451,38 +4488,43 @@ mod tests {
             &mut trampoline_rootfs.rootfs_dirs,
         );
 
-        let error = match result {
-            Err(error) => error,
-            Ok(_) => panic!("empty upper chain must fail the VM build"),
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("upper block chain must contain at least one layer"),
-            "unexpected build failure: {error}"
-        );
+        // The build must get past the exit wiring: either it succeeds, or it
+        // fails inside msb_krun's builder ("build VM: ..."), never in the
+        // layer validation that runs before the wiring.
+        if let Err(error) = &result {
+            assert!(
+                error.to_string().contains("build VM:"),
+                "build must fail past the exit wiring, inside the VM builder: {error}"
+            );
+        }
         let registered = registered_trampolines(&trampoline_rootfs);
 
-        // The exit callback build_vm chains in front of the exit observer
-        // removes the registered trampoline and still runs the observer. The
-        // VM never started on this failure path, so invoke the chained
-        // callback the way the VMM would at guest exit.
-        let observed = Arc::new(std::sync::Mutex::new(Vec::<i32>::new()));
-        let seen = Arc::clone(&observed);
-        let chained = trampoline_rootfs_cleanup_on_exit(registered.clone(), move |exit_code| {
-            seen.lock().unwrap().push(exit_code);
+        // THE wiring assertion: build_vm handed exactly the registered
+        // trampoline to the exit-cleanup wrapper. Removing the wiring in
+        // build_vm leaves the ledger empty and fails here.
+        EXIT_CLEANUP_WIRING.with(|wiring| {
+            let wiring = wiring.borrow();
+            assert_eq!(
+                wiring.len(),
+                1,
+                "build_vm must hand the registered trampoline to the exit cleanup"
+            );
+            assert_eq!(
+                wiring[0],
+                vec![registered[0].clone()],
+                "exit cleanup must reclaim exactly the registered trampoline"
+            );
         });
-        chained(3);
+
+        // The VM was never entered on this path, so the caller's guard is
+        // what reclaims the trampoline, exactly like a launch that returned
+        // before the guest took over. Reclamation is idempotent when the exit
+        // observer later races a forced teardown.
+        drop(trampoline_rootfs);
         assert!(
             !registered[0].exists(),
-            "the registered exit callback must remove the trampoline"
+            "guard drop after an unentered build must reclaim the trampoline"
         );
-        assert_eq!(*observed.lock().unwrap(), vec![3]);
-
-        // Dropping the guard afterwards reclaims idempotently: forced
-        // teardown can race the exit observer.
-        drop(trampoline_rootfs);
-        assert!(!registered[0].exists());
     }
 
     #[test]
