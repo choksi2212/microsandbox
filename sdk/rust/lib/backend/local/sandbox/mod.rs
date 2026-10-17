@@ -354,64 +354,43 @@ impl LocalBackend {
         }
 
         self.invalidate_control_session(model.id);
-        let mut pids = Vec::new();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let exit_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let departing = process_exit::RuntimeExit::capture(
-            pid,
-            &microsandbox_runtime::ipc::lifecycle_lock_path(&self.config().run_dir(), name),
-        )?;
-        // A live PID number cannot identify the runtime: after a host restart
-        // the catalog can name whatever process reused the number. Only the
-        // process proven by its inherited lifecycle lock is signalled, and
-        // through the captured handle, so a later PID occupant can never
-        // receive the signal.
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        {
-            if let (Some(pid), Some(proven)) =
-                (pid.filter(|p| Self::pid_is_alive(*p)), departing.as_ref())
-            {
-                proven.send_signal(libc::SIGKILL)?;
-                pids.push(pid);
+        let all_dead = {
+            let exit_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            if let Some(departing) = self.signal_runtime(name, pid, libc::SIGKILL)? {
+                tokio::time::timeout_at(exit_deadline, async {
+                    while !departing.has_exited()? {
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                    Ok::<_, std::io::Error>(())
+                })
+                .await
+                .map_err(|_| {
+                    crate::MicrosandboxError::Runtime(format!(
+                        "sandbox {name:?} runtime has not finished releasing resources after kill"
+                    ))
+                })??;
             }
-        }
+            true
+        };
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        {
-            if let Some(pid) = pid.filter(|p| Self::pid_is_alive(*p)) {
+        let all_dead = {
+            let signaled_pid = pid.filter(|p| Self::pid_is_alive(*p));
+            if let Some(pid) = signaled_pid {
                 Self::kill_pid(pid)?;
-                pids.push(pid);
-            }
-        }
-
-        if !pids.is_empty() {
-            let timeout = Duration::from_secs(5);
-            let start = std::time::Instant::now();
-            let poll_interval = Duration::from_millis(50);
-            while start.elapsed() < timeout {
-                if pids.iter().all(|pid| Self::pid_has_exited(*pid)) {
-                    break;
+                let timeout = Duration::from_secs(5);
+                let start = std::time::Instant::now();
+                let poll_interval = Duration::from_millis(50);
+                while start.elapsed() < timeout {
+                    if Self::pid_has_exited(pid) {
+                        break;
+                    }
+                    tokio::time::sleep(poll_interval).await;
                 }
-                tokio::time::sleep(poll_interval).await;
             }
-        }
+            signaled_pid.is_none_or(Self::pid_has_exited)
+        };
 
-        let all_dead = pids.is_empty() || pids.iter().all(|pid| Self::pid_has_exited(*pid));
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if let Some(departing) = departing {
-            tokio::time::timeout_at(exit_deadline, async {
-                while !departing.has_exited()? {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                Ok::<_, std::io::Error>(())
-            })
-            .await
-            .map_err(|_| {
-                crate::MicrosandboxError::Runtime(format!(
-                    "sandbox {name:?} runtime has not finished releasing resources after kill"
-                ))
-            })??;
-        }
         if all_dead {
             let db = self.db().await?.write();
             if let Err(e) = Self::update_sandbox_status(db, model.id, SandboxStatus::Stopped).await
@@ -470,20 +449,28 @@ impl LocalBackend {
 
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
-            // Same ownership rule as kill: the legacy drain signal only reaches
-            // a runtime proven by its inherited lifecycle lock, never whatever
-            // process reused a stale catalog PID after a restart.
-            let departing = process_exit::RuntimeExit::capture(
-                pid,
-                &microsandbox_runtime::ipc::lifecycle_lock_path(&self.config().run_dir(), name),
-            )?;
-            if pid.is_some_and(Self::pid_is_alive)
-                && let Some(proven) = departing.as_ref()
-            {
-                proven.send_signal(libc::SIGUSR1)?;
-            }
+            self.signal_runtime(name, pid, libc::SIGUSR1)?;
             Ok(())
         }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn signal_runtime(
+        &self,
+        name: &str,
+        pid: Option<i32>,
+        signal: libc::c_int,
+    ) -> MicrosandboxResult<Option<process_exit::RuntimeExit>> {
+        let departing = process_exit::RuntimeExit::capture(
+            pid,
+            &microsandbox_runtime::ipc::lifecycle_lock_path(&self.config().run_dir(), name),
+        )?;
+        if let (Some(_), Some(proven)) =
+            (pid.filter(|p| Self::pid_is_alive(*p)), departing.as_ref())
+        {
+            proven.send_signal(signal)?;
+        }
+        Ok(departing)
     }
 
     /// Local lifecycle: remove a stopped sandbox by name.
@@ -1199,9 +1186,7 @@ impl LocalBackend {
         Self::terminate_pid(pid)
     }
 
-    /// Trigger the legacy drain path (SIGUSR1) on platforms without the
-    /// lifecycle-proof machinery. Linux and macOS drain through the proven
-    /// handle instead.
+    /// Trigger the legacy drain path (SIGUSR1).
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     fn drain_pid(pid: i32) -> MicrosandboxResult<()> {
         nix::sys::signal::kill(
@@ -2567,9 +2552,6 @@ mod tests {
         waiter.join().unwrap();
     }
 
-    /// Child entry for the signal tests: holds the inherited lifecycle lock
-    /// descriptor (when the parent installs one) and waits for its parent
-    /// before exiting.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn lifecycle_signal_child() {
@@ -2577,10 +2559,7 @@ mod tests {
         if std::env::var_os("MSB_LIFECYCLE_SIGNAL_CHILD").is_none() {
             return;
         }
-        // Restore default signal semantics no matter how this copy was
-        // spawned: an inherited blocked mask or ignored disposition would let
-        // the child survive a stray SIGUSR1 and hide exactly the bug these
-        // tests pin.
+        // A stray SIGUSR1 must terminate this child.
         unsafe {
             libc::signal(libc::SIGUSR1, libc::SIG_DFL);
             let empty: libc::sigset_t = std::mem::zeroed();
@@ -2593,9 +2572,6 @@ mod tests {
         std::process::exit(0);
     }
 
-    /// Backend with Running catalog/run rows recording `pid`, plus a free
-    /// lifecycle lock file: the state a host restart leaves behind when the
-    /// recorded PID has been reused by an unrelated process.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     async fn backend_with_stale_running_pid(
         home: &std::path::Path,
@@ -2638,15 +2614,10 @@ mod tests {
             .status
     }
 
-    /// Kill must spare a live PID the backend cannot prove is the runtime.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn kill_sandbox_spares_unrelated_recycled_pid() {
         let home = tempfile::tempdir_in("/tmp").unwrap();
-        // The innocent process is a fresh copy of this test binary: it holds no
-        // lifecycle descriptor, and its runtime resets any inherited signal
-        // mask, so a stray SIGUSR1 cannot be silently swallowed the way a
-        // bare external `sleep` can.
         let mut innocent_command = Command::new(std::env::current_exe().unwrap());
         innocent_command
             .args([
@@ -2686,15 +2657,10 @@ mod tests {
         );
     }
 
-    /// Drain must spare a live PID the backend cannot prove is the runtime.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn drain_sandbox_spares_unrelated_recycled_pid() {
         let home = tempfile::tempdir_in("/tmp").unwrap();
-        // The innocent process is a fresh copy of this test binary: it holds no
-        // lifecycle descriptor, and its runtime resets any inherited signal
-        // mask, so a stray SIGUSR1 cannot be silently swallowed the way a
-        // bare external `sleep` can.
         let mut innocent_command = Command::new(std::env::current_exe().unwrap());
         innocent_command
             .args([
@@ -2734,7 +2700,6 @@ mod tests {
         );
     }
 
-    /// Kill still reaches a runtime proven by its inherited lifecycle lock.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn kill_sandbox_still_kills_a_proven_runtime() {
@@ -2817,7 +2782,6 @@ mod tests {
         );
     }
 
-    /// Drain still reaches a runtime proven by its inherited lifecycle lock.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn drain_sandbox_still_drains_a_proven_runtime() {

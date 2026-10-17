@@ -23,6 +23,7 @@ pub(super) struct RuntimeExit {
     queue: Option<OwnedFd>,
     pid: i32,
     identity: ProcessState,
+    signal_proven: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +70,7 @@ impl RuntimeExit {
             queue,
             pid,
             identity,
+            signal_proven: true,
         };
         // The PID may have disappeared/recycled between the identity read and registration.
         // Never wait for a new occupant, even if it later opens the same lifecycle file.
@@ -97,6 +99,7 @@ impl RuntimeExit {
             // edge. Use the birth-identified late-exit path instead of awaiting that edge.
             return Ok(Some(Self {
                 queue: None,
+                signal_proven: false,
                 ..observer
             }));
         }
@@ -135,10 +138,15 @@ impl RuntimeExit {
         }))
     }
 
-    /// Signal the process proven at capture. Darwin has no pid-scoped signal
-    /// syscall, so the send targets the PID whose birth identity was verified
-    /// under the sandbox transition guard rather than trusting the catalog.
     pub(super) fn send_signal(&self, signal: libc::c_int) -> io::Result<()> {
+        if !self.signal_proven
+            || process_state(self.pid)?.is_none_or(|state| {
+                state.birth != self.identity.birth || state.status == libc::SZOMB as u8
+            })
+        {
+            return Ok(());
+        }
+        // Darwin signals by PID; this check narrows but cannot close the reuse race.
         let result = unsafe { libc::kill(self.pid, signal) };
         if result < 0 {
             let error = io::Error::last_os_error();
@@ -214,8 +222,6 @@ fn lifecycle_matches(pid: i32, lifecycle: &Path) -> io::Result<bool> {
     if result <= 0 {
         let error = io::Error::last_os_error();
         return match error.raw_os_error() {
-            // A descriptor belonging to another user's process (EPERM/EACCES)
-            // is by definition not our runtime, exactly like a missing one.
             Some(libc::ESRCH | libc::EBADF | libc::ENOENT | libc::EPERM | libc::EACCES) => {
                 Ok(false)
             }
@@ -230,9 +236,6 @@ fn lifecycle_matches(pid: i32, lifecycle: &Path) -> io::Result<bool> {
     let info = unsafe { info.assume_init() };
     let expected = match std::fs::metadata(lifecycle) {
         Ok(metadata) => metadata,
-        // A run directory without the lifecycle file cannot prove any live
-        // process is this runtime; treat it as unproven instead of failing
-        // the stop or kill of a stale row.
         Err(error)
             if matches!(
                 error.kind(),
@@ -499,6 +502,7 @@ mod tests {
             queue: None,
             pid: barrier.pid,
             identity: barrier.identity,
+            signal_proven: barrier.signal_proven,
         };
         assert!(!late.has_exited().unwrap());
         drop(lifecycle);
@@ -533,6 +537,39 @@ mod tests {
     }
 
     #[test]
+    fn unproven_exit_observer_cannot_signal() {
+        let mut child = scopeguard::guard(
+            Command::new("/bin/sleep").arg("5").spawn().unwrap(),
+            |mut child| {
+                let _ = child.kill();
+                let _ = child.wait();
+            },
+        );
+        let pid = child.id() as i32;
+        let identity = process_state(pid).unwrap().unwrap();
+        let observer = RuntimeExit {
+            queue: None,
+            pid,
+            identity,
+            signal_proven: false,
+        };
+
+        observer.send_signal(libc::SIGKILL).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+
+        let stale = RuntimeExit {
+            signal_proven: true,
+            identity: ProcessState {
+                birth: (identity.birth.0 - 1, identity.birth.1),
+                ..identity
+            },
+            ..observer
+        };
+        stale.send_signal(libc::SIGKILL).unwrap();
+        assert!(child.try_wait().unwrap().is_none());
+    }
+
+    #[test]
     fn process_identity_layout_matches_libproc_and_recycled_identity_completes() {
         let pid = std::process::id() as i32;
         let state = process_state(pid).unwrap().unwrap();
@@ -562,6 +599,7 @@ mod tests {
             queue: None,
             pid,
             identity,
+            signal_proven: false,
         };
         assert!(stale.has_exited().unwrap());
         // Frozen public proc-info wrapper ABI, independently checked against the SDK headers.

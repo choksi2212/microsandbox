@@ -44,9 +44,6 @@ impl RuntimeExit {
         };
         let expected = match std::fs::metadata(lifecycle) {
             Ok(metadata) => metadata,
-            // A run directory without the lifecycle file cannot prove any live
-            // process is this runtime; treat it as unproven instead of failing
-            // the stop or kill of a stale row.
             Err(error) if lifecycle_fd_unreadable(&error) => return Ok(None),
             Err(error) => return Err(error),
         };
@@ -80,9 +77,6 @@ impl RuntimeExit {
         Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) != 0)
     }
 
-    /// Signal the pinned process. The handle was captured under the sandbox
-    /// transition guard, so a signal sent through it can only reach the process
-    /// whose inherited lifecycle lock was verified — never a later PID occupant.
     pub(super) fn send_signal(&self, signal: libc::c_int) -> std::io::Result<()> {
         let result = unsafe {
             libc::syscall(
@@ -95,9 +89,6 @@ impl RuntimeExit {
         };
         if result < 0 {
             let error = std::io::Error::last_os_error();
-            // The thread group finished exiting between capture and dispatch,
-            // so the requested signal has no remaining target. Callers converge
-            // the catalog row instead of failing on an already-dead runtime.
             return if error.raw_os_error() == Some(libc::ESRCH) {
                 Ok(())
             } else {
@@ -112,11 +103,6 @@ impl RuntimeExit {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
-/// Lifecycle metadata reads that cannot prove the recorded PID is our
-/// runtime: a process without the inherited lifecycle lock, one whose `/proc`
-/// entry belongs to another user after a restart recycled the PID, or a run
-/// directory whose lock file is gone. None of these identify our runtime, so
-/// capture reports the PID as unproven instead of surfacing the error.
 fn lifecycle_fd_unreadable(error: &std::io::Error) -> bool {
     matches!(
         error.kind(),
@@ -361,8 +347,6 @@ mod tests {
         child.stdin.as_mut().unwrap().write_all(b"d").unwrap();
         wait_line("disk-released");
         assert!(child.wait().unwrap().success());
-        // The pinned process is gone, so a later occupant of the number must
-        // not receive anything, and the already-exited runtime reports success.
-        assert!(barrier.send_signal(libc::SIGKILL).is_ok());
+        barrier.send_signal(libc::SIGKILL).unwrap();
     }
 }
